@@ -20,6 +20,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 pd.set_option("display.width", 140)
 pd.set_option("display.max_columns", 200)
 
+MAX_INCLUDED_MONTH = pd.Timestamp("2024-12-01")
+
 # ------------------------- logging -------------------------
 
 def init_logger(reports_root: Path):
@@ -115,6 +117,7 @@ def load_and_normalize(fp: Path) -> pd.DataFrame:
              day=1),
         errors="coerce"
     )
+    df = df.loc[df["date"].notna() & (df["date"] <= MAX_INCLUDED_MONTH)].copy()
     df = df.sort_values(["ticker","date"]).reset_index(drop=True)
     return df
 
