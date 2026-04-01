@@ -1,2 +1,5 @@
 /.idea/
 /Data Analysis/Seasonality Models/Most Important Results/
+.venv/
+__pycache__/
+.matplotlib/

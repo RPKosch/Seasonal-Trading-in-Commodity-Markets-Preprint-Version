@@ -41,7 +41,8 @@ EWMA_LAMBDA = 0.97
 
 # IO
 ROOT_DIR = Path().resolve().parent.parent / "Complete Data"
-OUT_DIR_MC = Path().resolve() / "Monte_Carlo_Outputs" / f"DVR_MC_p≤{SIG_LEVEL}_classic_vs_risk"
+OUT_DIR_MC = Path().resolve() / "Monte_Carlo_Outputs" / f"DVR_MC_p≤{SIG_LEVEL}_classic_vs_riskadjusted"
+RETURN_TRACKING_SUBDIR = "monthly_return_tracking"
 
 # Monte Carlo (MEB)
 MC_RUNS = 100
@@ -222,6 +223,73 @@ def nav_from_returns_on_grid(returns: pd.Series,
         out_vals.append(cur)
         out_idx.append(dt)
     return pd.Series(out_vals, index=out_idx, name="nav")
+
+
+def prepare_run_returns_series(returns: pd.Series,
+                               run: int,
+                               full_index: pd.DatetimeIndex) -> pd.Series:
+    s = returns.reindex(full_index).astype(float).rename(f"run_{run:03d}")
+    s.index = pd.DatetimeIndex(s.index)
+    s.index.name = "date"
+    return s
+
+
+def build_run_returns_frame(series_list: list[pd.Series],
+                            full_index: pd.DatetimeIndex) -> pd.DataFrame:
+    if not series_list:
+        return pd.DataFrame(index=full_index)
+    df = pd.concat([s.reindex(full_index) for s in series_list], axis=1).astype(float)
+    df.index = pd.DatetimeIndex(df.index)
+    df.index.name = "date"
+    return df
+
+
+def save_run_overlay_plot(run_returns: pd.DataFrame,
+                          out_path: Path,
+                          title: str,
+                          color: str,
+                          start_value: float = START_VALUE) -> None:
+    if run_returns.empty:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "matplotlib is required for Monte Carlo run overlay plots."
+        ) from exc
+
+    nav = start_value * (1.0 + run_returns.fillna(0.0)).cumprod()
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    for col in nav.columns:
+        ax.plot(nav.index, nav[col], color=color, alpha=0.18, linewidth=1.0)
+
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Portfolio value")
+    ax.grid(True, alpha=0.25)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def export_run_returns_and_plot(series_list: list[pd.Series],
+                                full_index: pd.DatetimeIndex,
+                                out_dir: Path,
+                                stem: str,
+                                title: str,
+                                color: str) -> None:
+    df = build_run_returns_frame(series_list, full_index)
+    if df.empty:
+        return
+    df.to_csv(out_dir / f"{stem}_monthly_returns_by_run.csv")
+    save_run_overlay_plot(
+        df,
+        out_dir / f"{stem}_monthly_return_paths.png",
+        title,
+        color,
+    )
 
 
 def sharpe_ratio(returns: list[Decimal] | np.ndarray) -> float:
@@ -869,6 +937,8 @@ def run_monte_carlo_both(n_runs=MC_RUNS, save_series=SAVE_SERIES, zero_noise=ZER
     # dedicated subfolder for all correlation outputs
     corr_dir = OUT_DIR_MC / "correlation_matrices"
     corr_dir.mkdir(parents=True, exist_ok=True)
+    tracking_dir = OUT_DIR_MC / RETURN_TRACKING_SUBDIR
+    tracking_dir.mkdir(parents=True, exist_ok=True)
 
     buf = io.StringIO()
 
@@ -928,6 +998,11 @@ def run_monte_carlo_both(n_runs=MC_RUNS, save_series=SAVE_SERIES, zero_noise=ZER
             'long': {'classic': 0, 'risk': 0, 'weighted': 0},
             'short': {'classic': 0, 'risk': 0}
         }
+        run_monthly_returns = {
+            'long': {'classic': [], 'risk': []},
+            'short': {'classic': [], 'risk': []},
+            'benchmark': [],
+        }
 
         for run in range(1, n_runs + 1):
             # 1) simulate log returns (MEB)
@@ -957,7 +1032,11 @@ def run_monte_carlo_both(n_runs=MC_RUNS, save_series=SAVE_SERIES, zero_noise=ZER
                 bench_apply_gross_long, TRADING_COST
             )
 
-            weighted_long_series = bench_apply_long_net.copy().rename("equal_weight_long_net")
+            benchmark_long_series = bench_apply_long_net.copy().rename("benchmark_long_net")
+            weighted_long_series = benchmark_long_series.copy().rename("equal_weight_long_net")
+            run_monthly_returns['benchmark'].append(
+                prepare_run_returns_series(benchmark_long_series, run, month_grid)
+            )
 
             for direction in ('long', 'short'):
                 if direction == 'long':
@@ -977,6 +1056,12 @@ def run_monte_carlo_both(n_runs=MC_RUNS, save_series=SAVE_SERIES, zero_noise=ZER
                     rank_risk, simple_sim, direction=direction,
                     start_dt=FINAL_SIM_START, end_dt=FINAL_SIM_END,
                     entry_cost=TRADING_COST, return_tickers=True
+                )
+                run_monthly_returns[direction]['classic'].append(
+                    prepare_run_returns_series(top1_classic, run, month_grid)
+                )
+                run_monthly_returns[direction]['risk'].append(
+                    prepare_run_returns_series(top1_risk, run, month_grid)
                 )
 
                 # NAVs (Top-1 only) for display context
@@ -1462,6 +1547,49 @@ def run_monte_carlo_both(n_runs=MC_RUNS, save_series=SAVE_SERIES, zero_noise=ZER
                         save_correlation_heatmap(
                             corr, corr_dir / "metrics_correlation_heatmap.pdf"
                         )
+
+        section("Saved monthly return tracking outputs")
+        export_run_returns_and_plot(
+            run_monthly_returns['long']['classic'],
+            month_grid,
+            tracking_dir,
+            "long_classic",
+            f"DVR Monte Carlo | Long Classic | Cumulative value paths ({n_runs} runs)",
+            "tab:green",
+        )
+        export_run_returns_and_plot(
+            run_monthly_returns['long']['risk'],
+            month_grid,
+            tracking_dir,
+            "long_risk_adjusted",
+            f"DVR Monte Carlo | Long Risk-adjusted | Cumulative value paths ({n_runs} runs)",
+            "tab:blue",
+        )
+        export_run_returns_and_plot(
+            run_monthly_returns['short']['classic'],
+            month_grid,
+            tracking_dir,
+            "short_classic",
+            f"DVR Monte Carlo | Short Classic | Cumulative value paths ({n_runs} runs)",
+            "tab:red",
+        )
+        export_run_returns_and_plot(
+            run_monthly_returns['short']['risk'],
+            month_grid,
+            tracking_dir,
+            "short_risk_adjusted",
+            f"DVR Monte Carlo | Short Risk-adjusted | Cumulative value paths ({n_runs} runs)",
+            "tab:orange",
+        )
+        export_run_returns_and_plot(
+            run_monthly_returns['benchmark'],
+            month_grid,
+            tracking_dir,
+            "benchmark",
+            f"DVR Monte Carlo | Equal-weight benchmark | Cumulative value paths ({n_runs} runs)",
+            "tab:gray",
+        )
+        print(f"Saved CSVs and plots to: {tracking_dir}\n")
 
     # === Write terminal printout to file ===
     with open(OUT_DIR_MC / "console_report.txt", "w", encoding="utf-8") as f:
